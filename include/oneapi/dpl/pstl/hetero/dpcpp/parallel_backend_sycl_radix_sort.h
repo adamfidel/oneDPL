@@ -16,6 +16,7 @@
 #ifndef _ONEDPL_parallel_backend_sycl_radix_sort_H
 #define _ONEDPL_parallel_backend_sycl_radix_sort_H
 
+
 #include <limits>
 
 #include "sycl_defs.h"
@@ -205,7 +206,7 @@ template <typename _T>
 constexpr ::std::uint32_t
 __get_buckets_in_type(::std::uint32_t __radix_bits)
 {
-    return (sizeof(_T) * std::numeric_limits<unsigned char>::digits) / __radix_bits;
+    return (sizeof(_T) * std::numeric_limits<unsigned char>::digits + __radix_bits - 1) / __radix_bits;
 }
 
 // required for descending comparator support
@@ -485,6 +486,8 @@ struct __radix_sort_scan_submitter<_RadixLocalScanName, __internal::__optional_k
     }
 };
 
+struct __nasty_hacky_subgroup_mask { ::std::uint32_t bits; ::std::size_t unused; };
+
 //-----------------------------------------------------------------------
 // radix sort: a function for reorder phase of one iteration
 //-----------------------------------------------------------------------
@@ -518,6 +521,9 @@ __radix_sort_reorder_submit(_ExecutionPolicy&& __exec, ::std::size_t __segments,
     const ::std::size_t __blocks_total = __get_roundedup_div(__inout_buf_size, __block_size);
     const ::std::size_t __blocks_per_segment = __get_roundedup_div(__blocks_total, __segments);
 
+    // FOO 16 524288 32 16384 32
+    // printf("FOO %u %lu %lu %lu %lu\n", __radix_states, __blocks_total, __blocks_per_segment, __segments, __sg_size);
+
     auto __offset_rng =
         oneapi::dpl::__ranges::all_view<::std::uint32_t, __par_backend_hetero::access_mode::read>(__offset_buf);
 
@@ -542,6 +548,10 @@ __radix_sort_reorder_submit(_ExecutionPolicy&& __exec, ::std::size_t __segments,
                 const ::std::size_t __self_lidx = __self_item.get_local_id(0);
                 const ::std::size_t __wgroup_idx = __self_item.get_group(0);
                 const ::std::size_t __start_idx = __blocks_per_segment * __block_size * __wgroup_idx + __self_lidx;
+
+                ::std::uint32_t __item_mask = ::std::numeric_limits<::std::uint32_t>::max() >> (32 - __self_lidx);
+                auto __item_sg_mask = sycl::ext::oneapi::detail::Builder::createSubGroupMask<sycl::ext::oneapi::sub_group_mask>(__item_mask, 32);
+
                 // 1. create a private array for storing offset values
                 //    and add total offset and offset for compute unit for a certain radix state
                 _OffsetT __offset_arr[__radix_states];
@@ -575,13 +585,19 @@ __radix_sort_reorder_submit(_ExecutionPolicy&& __exec, ::std::size_t __segments,
                     {
                         ::std::uint32_t __is_current_bucket = __bucket_val == __radix_state_idx;
                         const auto& __sgroup = __self_item.get_sub_group();
-                        ::std::uint32_t __sg_item_offset = __dpl_sycl::__exclusive_scan_over_group(
+                        /*::std::uint32_t __sg_item_offset = __dpl_sycl::__exclusive_scan_over_group(
                             __sgroup, __is_current_bucket, __dpl_sycl::__plus<::std::uint32_t>());
 
                         __new_offset_idx |= __is_current_bucket * (__offset_arr[__radix_state_idx] + __sg_item_offset);
                         // the last scanned value may not contain number of all copies, thus adding __is_current_bucket
                         ::std::uint32_t __sg_total_offset = __dpl_sycl::__group_broadcast(
-                            __sgroup, __sg_item_offset + __is_current_bucket, __sg_size - 1);
+                            __sgroup, __sg_item_offset + __is_current_bucket, __sg_size - 1);*/
+
+                        auto __peer_mask = sycl::ext::oneapi::group_ballot(__sgroup, __is_current_bucket);
+                        ::std::uint32_t __sg_total_offset = sycl::popcount(reinterpret_cast<__nasty_hacky_subgroup_mask*>(&__peer_mask)->bits);
+                        __peer_mask &= __item_sg_mask;
+                        __new_offset_idx |= __is_current_bucket * (__offset_arr[__radix_state_idx] + sycl::popcount(reinterpret_cast<__nasty_hacky_subgroup_mask*>(&__peer_mask)->bits));
+
 
                         __offset_arr[__radix_state_idx] = __offset_arr[__radix_state_idx] + __sg_total_offset;
                     }
@@ -648,6 +664,10 @@ __parallel_radix_sort_iteration(_ExecutionPolicy&& __exec, ::std::size_t __segme
     if (__block_size < __radix_states)
         __block_size = __radix_states;
 
+#ifdef AFIDEL_DBG
+    printf("block size: %lu\n", __block_size);
+#endif
+
     // 1. Count Phase
     sycl::event __count_event = __radix_sort_count_submit<_RadixCountKernel, __radix_bits, __is_comp_asc>(
         __exec, __segments, __block_size, __radix_iter, ::std::forward<_InRange>(__in_rng), __tmp_buf,
@@ -701,8 +721,14 @@ __parallel_radix_sort(_ExecutionPolicy&& __exec, _Range&& __in_rng)
 
     // radix bits represent number of processed bits in each value during one iteration
     const ::std::uint32_t __radix_bits = 4;
+    //const ::std::uint32_t __radix_bits = 6;
     const ::std::uint32_t __radix_iters = __get_buckets_in_type<_T>(__radix_bits);
     const ::std::uint32_t __radix_states = __get_states_in_bits(__radix_bits);
+
+#ifdef AFIDEL_DBG
+    printf("radix bits=%u iters=%u states=%u\n", __radix_bits, __radix_iters, __radix_states);
+#endif
+
 
     // additional 2 * __radix_states elements are used for getting local and global offsets from count values
     const ::std::size_t __tmp_buf_size = __segments * __radix_states + 2 * __radix_states;
@@ -715,7 +741,7 @@ __parallel_radix_sort(_ExecutionPolicy&& __exec, _Range&& __in_rng)
         __out_buffer_holder.get_buffer());
 
     // iterations per each bucket
-    assert("Number of iterations must be even" && __radix_iters % 2 == 0);
+    //assert("Number of iterations must be even" && __radix_iters % 2 == 0);
     // TODO: radix for bool can be made using 1 iteration (x2 speedup against current implementation)
     sycl::event __iteration_event{};
     for (::std::uint32_t __radix_iter = 0; __radix_iter < __radix_iters; ++__radix_iter)
