@@ -54,7 +54,10 @@ __get_abs(_Source __t)
 
 } // namespace internal
 
-#if __cplusplus > 201103L
+// Some C++ standard libraries implement std::gcd and std::lcm as recursive functions,
+// which prevents their use in SYCL kernels (see the SYCL specification for more details).
+// Therefore oneDPL provides its own implementation.
+
 // gcd
 template <typename _Mn, typename _Nn>
 constexpr ::std::common_type_t<_Mn, _Nn>
@@ -94,7 +97,6 @@ lcm(_Mn __m, _Nn __n)
     _Rp __val2 = oneapi::dpl::internal::__get_abs<_Rp>(__n);
     return __val1 * __val2;
 }
-#endif
 
 } // end namespace dpl
 } // end namespace oneapi

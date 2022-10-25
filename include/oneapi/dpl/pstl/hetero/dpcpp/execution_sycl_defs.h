@@ -114,35 +114,11 @@ class fpga_policy : public device_policy<KernelName>
 // In order to be useful oneapi::dpl::execution::dpcpp_default.queue() from one translation unit should be equal to
 // oneapi::dpl::execution::dpcpp_default.queue() from another TU.
 // Starting with c++17 we can simply define sycl as inline variable.
-// But for c++11 we need to simulate this feature using local static variable and inline function to achieve
-// a single definition across all TUs. As it's required for underlying sycl's queue to behave in the same way
-// as it's copy, we simply copy-construct a static variable from a reference to that object.
 #    if __cplusplus >= 201703L
 
 inline device_policy<> dpcpp_default{};
 #        if _ONEDPL_FPGA_DEVICE
 inline fpga_policy<> dpcpp_fpga{};
-#        endif // _ONEDPL_FPGA_DEVICE
-
-#    else
-
-template <typename DeviceSelector>
-inline device_policy<>&
-__get_default_policy_object(DeviceSelector selector)
-{
-    static device_policy<> __single_base_obj(selector);
-    return __single_base_obj;
-}
-static device_policy<> dpcpp_default{__get_default_policy_object(sycl::default_selector{})};
-
-#        if _ONEDPL_FPGA_DEVICE
-inline fpga_policy<>&
-__get_fpga_policy_object()
-{
-    static fpga_policy<> __single_base_obj{};
-    return __single_base_obj;
-}
-static fpga_policy<> dpcpp_fpga{__get_fpga_policy_object()};
 #        endif // _ONEDPL_FPGA_DEVICE
 
 #    endif // __cplusplus >= 201703L
@@ -378,7 +354,7 @@ __max_compute_units(_ExecutionPolicy&& __policy)
 //-----------------------------------------------------------------------------
 
 // 20201214 value corresponds to Intel(R) oneAPI C++ Compiler Classic 2021.1.2 Patch release
-#define _USE_KERNEL_DEVICE_SPECIFIC_API (__SYCL_COMPILER_VERSION > 20201214)
+#define _USE_KERNEL_DEVICE_SPECIFIC_API (__SYCL_COMPILER_VERSION > 20201214) || (__LIBSYCL_VERSION >= 50700)
 
 template <typename _ExecutionPolicy>
 ::std::size_t

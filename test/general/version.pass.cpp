@@ -21,22 +21,16 @@
 
 #include "support/utils.h"
 
-#if defined(__has_include)
-#define HAS_EXECUTION_HEADER __has_include(<execution>)
-#else
-#define HAS_EXECUTION_HEADER 0
-#endif
-
-#if __cplusplus < 201703L || !HAS_EXECUTION_HEADER
+#if !__has_include(<execution>)
 static_assert(_PSTL_VERSION == 11000, "");
 static_assert(_PSTL_VERSION_MAJOR == 11, "");
 static_assert(_PSTL_VERSION_MINOR == 00, "");
 static_assert(_PSTL_VERSION_PATCH == 0, "");
 #endif
 
-static_assert(ONEDPL_VERSION_MAJOR == 2021, "");
-static_assert(ONEDPL_VERSION_MINOR == 7, "");
-static_assert(ONEDPL_VERSION_PATCH == 1, "");
+static_assert(ONEDPL_VERSION_MAJOR == 2022, "");
+static_assert(ONEDPL_VERSION_MINOR == 0, "");
+static_assert(ONEDPL_VERSION_PATCH == 0, "");
 
 int main() {
 
