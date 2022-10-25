@@ -531,6 +531,8 @@ __radix_sort_reorder_submit(_ExecutionPolicy&& __exec, ::std::size_t __segments,
     sycl::event __reorder_event = __exec.queue().submit([&](sycl::handler& __hdl) {
         __hdl.depends_on(__dependency_event);
 
+        auto __offset_arr = sycl::accessor<_OffsetT, 1, access_mode::read_write, __dpl_sycl::__target::local>(__radix_states, __hdl);
+
         // access with offsets from each work group
         oneapi::dpl::__ranges::__require_access(__hdl, __offset_rng);
 
@@ -546,28 +548,33 @@ __radix_sort_reorder_submit(_ExecutionPolicy&& __exec, ::std::size_t __segments,
             sycl::nd_range<1>(__segments * __sg_size, __sg_size), [=](sycl::nd_item<1> __self_item) {
                 // item info
                 const ::std::size_t __self_lidx = __self_item.get_local_id(0);
+                const auto __group = __self_item.get_group();
+                const auto __sgroup = __self_item.get_sub_group();
                 const ::std::size_t __wgroup_idx = __self_item.get_group(0);
                 const ::std::size_t __start_idx = __blocks_per_segment * __block_size * __wgroup_idx + __self_lidx;
 
                 ::std::uint32_t __item_mask = ::std::numeric_limits<::std::uint32_t>::max() >> (32 - __self_lidx);
-                auto __item_sg_mask = sycl::ext::oneapi::detail::Builder::createSubGroupMask<sycl::ext::oneapi::sub_group_mask>(__item_mask, 32);
+                //auto __item_sg_mask = sycl::ext::oneapi::detail::Builder::createSubGroupMask<sycl::ext::oneapi::sub_group_mask>(__item_mask, 32);
 
-                // 1. create a private array for storing offset values
+                // 1. create a shared array for storing offset values
                 //    and add total offset and offset for compute unit for a certain radix state
-                _OffsetT __offset_arr[__radix_states];
-                const ::std::uint32_t __global_offset_start_idx = (__segments + 1) * __radix_states;
-                for (::std::uint32_t __radix_state_idx = 0; __radix_state_idx < __radix_states; ++__radix_state_idx)
+                if (__group.leader())
                 {
-                    const ::std::uint32_t __global_offset_idx = __global_offset_start_idx + __radix_state_idx;
-                    const ::std::uint32_t __local_offset_idx = __wgroup_idx + (__segments + 1) * __radix_state_idx;
-                    __offset_arr[__radix_state_idx] =
-                        __offset_rng[__global_offset_idx] + __offset_rng[__local_offset_idx];
+                    const ::std::uint32_t __global_offset_start_idx = (__segments + 1) * __radix_states;
+                    for (::std::uint32_t __radix_state_idx = 0; __radix_state_idx < __radix_states; ++__radix_state_idx)
+                    {
+                        const ::std::uint32_t __global_offset_idx = __global_offset_start_idx + __radix_state_idx;
+                        const ::std::uint32_t __local_offset_idx = __wgroup_idx + (__segments + 1) * __radix_state_idx;
+                        __offset_arr[__radix_state_idx] =
+                            __offset_rng[__global_offset_idx] + __offset_rng[__local_offset_idx];
+                    }
                 }
+                sycl::group_barrier(__sgroup);
 
                 // find offsets for the same values within a segment and fill the resulting buffer
                 for (::std::size_t __block_idx = 0; __block_idx < __blocks_per_segment * __it_size; ++__block_idx)
                 {
-                    const ::std::size_t __val_idx = __start_idx + __sg_size * __block_idx;
+                   const ::std::size_t __val_idx = __start_idx + __sg_size * __block_idx;
 
                     // get value, convert it to ordered (in terms of bitness)
                     // if the index is outside of the range, use fake value which will not affect other values
@@ -579,7 +586,39 @@ __radix_sort_reorder_submit(_ExecutionPolicy&& __exec, ::std::size_t __segments,
                     ::std::uint32_t __bucket_val =
                         __get_bucket_value<__radix_bits, __is_comp_asc>(__batch_val, __radix_iter);
 
-                    _OffsetT __new_offset_idx = 0;
+                    _OffsetT __new_offset_idx = __offset_arr[__bucket_val];
+                    sycl::group_barrier(__sgroup);
+
+                    // Figure out how many work-items in my subgroup have the same bucket value
+                    ::std::uint32_t __peer_mask = ~0;
+                    for (::std::uint32_t __radix_bit = 0; __radix_bit < __radix_bits; ++__radix_bit)
+                    {
+                        ::std::uint32_t __current_bit_mask = 1 << __radix_bit;
+                        bool __is_bit_set = (__bucket_val & __current_bit_mask) != 0;
+                        auto __is_bit_set_vote = sycl::ext::oneapi::group_ballot(__sgroup, __is_bit_set);
+                        ::std::uint32_t __is_bit_set_vote_mask = reinterpret_cast<__nasty_hacky_subgroup_mask*>(&__is_bit_set_vote)->bits;
+
+                        // Flip the votes if my bit wasn't set
+                        // TODO: maybe replace branch with sign extend left shift + xor
+                        if (!__is_bit_set)
+                            __is_bit_set_vote_mask = ~__is_bit_set_vote_mask;
+                        __peer_mask &= __is_bit_set_vote_mask;
+                    }
+
+                    ::std::uint32_t __num_bucket_peers = sycl::popcount(__peer_mask);
+                    __peer_mask &= __item_mask;
+                    ::std::uint32_t __sg_total_offset = sycl::popcount(__peer_mask);
+
+                    // Lowest ranked work-item with this bucket should update shared array of offsets
+                    if (__sg_total_offset == 0)
+                    {
+                        __offset_arr[__bucket_val] += __num_bucket_peers;
+                    }
+
+                    __new_offset_idx += __sg_total_offset;
+                    sycl::group_barrier(__sgroup);
+
+#if 0
                     // TODO: most computation-heavy code segment - find a better optimized solution
                     for (::std::uint32_t __radix_state_idx = 0; __radix_state_idx < __radix_states; ++__radix_state_idx)
                     {
@@ -601,6 +640,7 @@ __radix_sort_reorder_submit(_ExecutionPolicy&& __exec, ::std::size_t __segments,
 
                         __offset_arr[__radix_state_idx] = __offset_arr[__radix_state_idx] + __sg_total_offset;
                     }
+#endif
 
                     if (__val_idx < __inout_buf_size)
                         __output_rng[__new_offset_idx] = __input_rng[__val_idx];
