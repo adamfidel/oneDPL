@@ -527,6 +527,8 @@ __radix_sort_reorder_submit(_ExecutionPolicy&& __exec, ::std::size_t __segments,
     auto __offset_rng =
         oneapi::dpl::__ranges::all_view<::std::uint32_t, __par_backend_hetero::access_mode::read>(__offset_buf);
 
+    ::std::uint32_t __states_per_item = __radix_states / __sg_size;
+
     // submit to reorder values
     sycl::event __reorder_event = __exec.queue().submit([&](sycl::handler& __hdl) {
         __hdl.depends_on(__dependency_event);
@@ -556,19 +558,18 @@ __radix_sort_reorder_submit(_ExecutionPolicy&& __exec, ::std::size_t __segments,
                 ::std::uint32_t __item_mask = ::std::numeric_limits<::std::uint32_t>::max() >> (32 - __self_lidx);
                 //auto __item_sg_mask = sycl::ext::oneapi::detail::Builder::createSubGroupMask<sycl::ext::oneapi::sub_group_mask>(__item_mask, 32);
 
-                // 1. create a shared array for storing offset values
-                //    and add total offset and offset for compute unit for a certain radix state
-                if (__group.leader())
+                // 1. cooperatively fill a shared array for offsets with sum of
+                //    total offset and offset for compute unit for a certain radix state
+                const ::std::uint32_t __global_offset_start_idx = (__segments + 1) * __radix_states;
+
+                for (::std::uint32_t __radix_state = __self_lidx; __radix_state < __radix_states; __radix_state += __sg_size)
                 {
-                    const ::std::uint32_t __global_offset_start_idx = (__segments + 1) * __radix_states;
-                    for (::std::uint32_t __radix_state_idx = 0; __radix_state_idx < __radix_states; ++__radix_state_idx)
-                    {
-                        const ::std::uint32_t __global_offset_idx = __global_offset_start_idx + __radix_state_idx;
-                        const ::std::uint32_t __local_offset_idx = __wgroup_idx + (__segments + 1) * __radix_state_idx;
-                        __offset_arr[__radix_state_idx] =
-                            __offset_rng[__global_offset_idx] + __offset_rng[__local_offset_idx];
-                    }
+                    const ::std::uint32_t __global_offset_idx = __global_offset_start_idx + __radix_state;
+                    const ::std::uint32_t __local_offset_idx = __wgroup_idx + (__segments + 1) * __radix_state;
+                    __offset_arr[__radix_state] =
+                        __offset_rng[__global_offset_idx] + __offset_rng[__local_offset_idx];
                 }
+
                 sycl::group_barrier(__sgroup);
 
                 // find offsets for the same values within a segment and fill the resulting buffer
@@ -617,30 +618,6 @@ __radix_sort_reorder_submit(_ExecutionPolicy&& __exec, ::std::size_t __segments,
 
                     __new_offset_idx += __sg_total_offset;
                     sycl::group_barrier(__sgroup);
-
-#if 0
-                    // TODO: most computation-heavy code segment - find a better optimized solution
-                    for (::std::uint32_t __radix_state_idx = 0; __radix_state_idx < __radix_states; ++__radix_state_idx)
-                    {
-                        ::std::uint32_t __is_current_bucket = __bucket_val == __radix_state_idx;
-                        const auto& __sgroup = __self_item.get_sub_group();
-                        /*::std::uint32_t __sg_item_offset = __dpl_sycl::__exclusive_scan_over_group(
-                            __sgroup, __is_current_bucket, __dpl_sycl::__plus<::std::uint32_t>());
-
-                        __new_offset_idx |= __is_current_bucket * (__offset_arr[__radix_state_idx] + __sg_item_offset);
-                        // the last scanned value may not contain number of all copies, thus adding __is_current_bucket
-                        ::std::uint32_t __sg_total_offset = __dpl_sycl::__group_broadcast(
-                            __sgroup, __sg_item_offset + __is_current_bucket, __sg_size - 1);*/
-
-                        auto __peer_mask = sycl::ext::oneapi::group_ballot(__sgroup, __is_current_bucket);
-                        ::std::uint32_t __sg_total_offset = sycl::popcount(reinterpret_cast<__nasty_hacky_subgroup_mask*>(&__peer_mask)->bits);
-                        __peer_mask &= __item_sg_mask;
-                        __new_offset_idx |= __is_current_bucket * (__offset_arr[__radix_state_idx] + sycl::popcount(reinterpret_cast<__nasty_hacky_subgroup_mask*>(&__peer_mask)->bits));
-
-
-                        __offset_arr[__radix_state_idx] = __offset_arr[__radix_state_idx] + __sg_total_offset;
-                    }
-#endif
 
                     if (__val_idx < __inout_buf_size)
                         __output_rng[__new_offset_idx] = __input_rng[__val_idx];
